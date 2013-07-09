@@ -2,7 +2,6 @@ package docker
 
 import (
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -303,80 +302,6 @@ func (img *Image) layer() (string, error) {
 		return "", err
 	}
 	return layerPath(root), nil
-}
-
-func (img *Image) Checksum() (string, error) {
-	img.graph.checksumLock[img.ID].Lock()
-	defer img.graph.checksumLock[img.ID].Unlock()
-
-	root, err := img.root()
-	if err != nil {
-		return "", err
-	}
-
-	checksums, err := img.graph.getStoredChecksums()
-	if err != nil {
-		return "", err
-	}
-	if checksum, ok := checksums[img.ID]; ok {
-		return checksum, nil
-	}
-
-	layer, err := img.layer()
-	if err != nil {
-		return "", err
-	}
-	jsonData, err := ioutil.ReadFile(jsonPath(root))
-	if err != nil {
-		return "", err
-	}
-
-	var layerData io.Reader
-
-	if file, err := os.Open(layerArchivePath(root)); err != nil {
-		if os.IsNotExist(err) {
-			layerData, err = Tar(layer, Xz)
-			if err != nil {
-				return "", err
-			}
-		} else {
-			return "", err
-		}
-	} else {
-		defer file.Close()
-		layerData = file
-	}
-
-	h := sha256.New()
-	if _, err := h.Write(jsonData); err != nil {
-		return "", err
-	}
-	if _, err := h.Write([]byte("\n")); err != nil {
-		return "", err
-	}
-
-	if _, err := io.Copy(h, layerData); err != nil {
-		return "", err
-	}
-	hash := "sha256:" + hex.EncodeToString(h.Sum(nil))
-
-	// Reload the json file to make sure not to overwrite faster sums
-	img.graph.lockSumFile.Lock()
-	defer img.graph.lockSumFile.Unlock()
-
-	checksums, err = img.graph.getStoredChecksums()
-	if err != nil {
-		return "", err
-	}
-
-	checksums[img.ID] = hash
-
-	// Dump the checksums to disc
-	if err := img.graph.storeChecksums(checksums); err != nil {
-		return hash, err
-	}
-
-	return hash, nil
 }
 
 func (img *Image) getParentsSize(size int64) int64 {

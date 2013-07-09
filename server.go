@@ -359,12 +359,6 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, name, ask
 		return err
 	}
 
-	utils.Debugf("Updating checksums")
-	// Reload the json file to make sure not to overwrite faster sums
-	if err := srv.runtime.graph.UpdateChecksums(repoData.ImgList); err != nil {
-		return err
-	}
-
 	utils.Debugf("Retrieving the tag list")
 	tagsList, err := r.GetRemoteTags(repoData.Endpoints, name, repoData.Tokens)
 	if err != nil {
@@ -374,9 +368,8 @@ func (srv *Server) pullRepository(r *registry.Registry, out io.Writer, name, ask
 
 	for tag, id := range tagsList {
 		repoData.ImgList[id] = &registry.ImgData{
-			ID:       id,
-			Tag:      tag,
-			Checksum: "",
+			ID:  id,
+			Tag: tag,
 		}
 	}
 
@@ -498,41 +491,6 @@ func (srv *Server) ImagePull(name string, tag string, out io.Writer, sf *utils.S
 	return nil
 }
 
-// Retrieve the checksum of an image
-// Priority:
-// - Check on the stored checksums
-// - Check if the archive exists, if it does not, ask the registry
-// - If the archive does exists, process the checksum from it
-// - If the archive does not exists and not found on registry, process checksum from layer
-func (srv *Server) getChecksum(imageID string) (string, error) {
-	// FIXME: Use in-memory map instead of reading the file each time
-	if sums, err := srv.runtime.graph.getStoredChecksums(); err != nil {
-		return "", err
-	} else if checksum, exists := sums[imageID]; exists {
-		return checksum, nil
-	}
-
-	img, err := srv.runtime.graph.Get(imageID)
-	if err != nil {
-		return "", err
-	}
-
-	if _, err := os.Stat(layerArchivePath(srv.runtime.graph.imageRoot(imageID))); err != nil {
-		if os.IsNotExist(err) {
-			// TODO: Ask the registry for the checksum
-			//       As the archive is not there, it is supposed to come from a pull.
-		} else {
-			return "", err
-		}
-	}
-
-	checksum, err := img.Checksum()
-	if err != nil {
-		return "", err
-	}
-	return checksum, nil
-}
-
 // Retrieve the all the images to be uploaded in the correct order
 // Note: we can't use a map as it is not ordered
 func (srv *Server) getImageList(localRepo map[string]string) ([]*registry.ImgData, error) {
@@ -549,14 +507,9 @@ func (srv *Server) getImageList(localRepo map[string]string) ([]*registry.ImgDat
 				return nil
 			}
 			imageSet[img.ID] = struct{}{}
-			checksum, err := srv.getChecksum(img.ID)
-			if err != nil {
-				return err
-			}
 			imgList = append([]*registry.ImgData{{
-				ID:       img.ID,
-				Checksum: checksum,
-				Tag:      tag,
+				ID:  img.ID,
+				Tag: tag,
 			}}, imgList...)
 			return nil
 		})
@@ -566,7 +519,7 @@ func (srv *Server) getImageList(localRepo map[string]string) ([]*registry.ImgDat
 
 func (srv *Server) pushRepository(r *registry.Registry, out io.Writer, name string, localRepo map[string]string, indexEp string, sf *utils.StreamFormatter) error {
 	out = utils.NewWriteFlusher(out)
-	out.Write(sf.FormatStatus("Processing checksums"))
+
 	imgList, err := srv.getImageList(localRepo)
 	if err != nil {
 		return err
@@ -595,10 +548,13 @@ func (srv *Server) pushRepository(r *registry.Registry, out io.Writer, name stri
 				fmt.Fprintf(out, "Image %s already on registry, skipping\n", name)
 				continue
 			}
-			if err := srv.pushImage(r, out, name, elem.ID, ep, repoData.Tokens, sf); err != nil {
+			if checksum, err := srv.pushImage(r, out, name, elem.ID, ep, repoData.Tokens, sf); err != nil {
 				// FIXME: Continue on error?
 				return err
+			} else {
+				elem.Checksum = checksum
 			}
+
 			out.Write(sf.FormatStatus("Pushing tags for rev [%s] on {%s}", elem.ID, ep+"repositories/"+srvName+"/tags/"+elem.Tag))
 			if err := r.PushRegistryTag(srvName, elem.ID, elem.Tag, ep, repoData.Tokens); err != nil {
 				return err
@@ -613,64 +569,38 @@ func (srv *Server) pushRepository(r *registry.Registry, out io.Writer, name stri
 	return nil
 }
 
-func (srv *Server) pushImage(r *registry.Registry, out io.Writer, remote, imgID, ep string, token []string, sf *utils.StreamFormatter) error {
+func (srv *Server) pushImage(r *registry.Registry, out io.Writer, remote, imgID, ep string, token []string, sf *utils.StreamFormatter) (string, error) {
 	out = utils.NewWriteFlusher(out)
 	jsonRaw, err := ioutil.ReadFile(path.Join(srv.runtime.graph.Root, imgID, "json"))
 	if err != nil {
-		return fmt.Errorf("Error while retreiving the path for {%s}: %s", imgID, err)
+		return "", fmt.Errorf("Error while retreiving the path for {%s}: %s", imgID, err)
 	}
 	out.Write(sf.FormatStatus("Pushing %s", imgID))
 
-	// Make sure we have the image's checksum
-	checksum, err := srv.getChecksum(imgID)
-	if err != nil {
-		return err
-	}
 	imgData := &registry.ImgData{
-		ID:       imgID,
-		Checksum: checksum,
+		ID: imgID,
 	}
 
 	// Send the json
 	if err := r.PushImageJSONRegistry(imgData, jsonRaw, ep, token); err != nil {
 		if err == registry.ErrAlreadyExists {
 			out.Write(sf.FormatStatus("Image %s already uploaded ; skipping", imgData.ID))
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
 
-	// Retrieve the tarball to be sent
-	var layerData *TempArchive
-	// If the archive exists, use it
-	file, err := os.Open(layerArchivePath(srv.runtime.graph.imageRoot(imgID)))
+	// If the archive does not exist, create one from the layer
+	layerData, err := srv.runtime.graph.TempLayerArchive(imgID, Uncompressed, sf, out)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// If the archive does not exist, create one from the layer
-			layerData, err = srv.runtime.graph.TempLayerArchive(imgID, Xz, sf, out)
-			if err != nil {
-				return fmt.Errorf("Failed to generate layer archive: %s", err)
-			}
-		} else {
-			return err
-		}
-	} else {
-		defer file.Close()
-		st, err := file.Stat()
-		if err != nil {
-			return err
-		}
-		layerData = &TempArchive{
-			File: file,
-			Size: st.Size(),
-		}
+		return "", fmt.Errorf("Failed to generate layer archive: %s", err)
 	}
 
 	// Send the layer
 	if err := r.PushImageLayerRegistry(imgData.ID, utils.ProgressReader(layerData, int(layerData.Size), out, sf.FormatProgress("Pushing", "%v/%v (%v)"), sf), ep, token); err != nil {
-		return err
+		return "", err
 	}
-	return nil
+	return "", nil
 }
 
 // FIXME: Allow to interupt current push when new push of same image is done.
@@ -707,7 +637,7 @@ func (srv *Server) ImagePush(name string, out io.Writer, sf *utils.StreamFormatt
 
 	var token []string
 	out.Write(sf.FormatStatus("The push refers to an image: [%s]", name))
-	if err := srv.pushImage(r, out, name, img.ID, endpoint, token, sf); err != nil {
+	if _, err := srv.pushImage(r, out, name, img.ID, endpoint, token, sf); err != nil {
 		return err
 	}
 	return nil
