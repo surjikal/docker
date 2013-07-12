@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"hash"
 	"io"
+	"sort"
 	"strconv"
 )
 
@@ -130,6 +131,7 @@ func (ts *TarSum) Read(buf []byte) (int, error) {
 }
 
 func (ts *TarSum) Sum() string {
+	sort.Strings(ts.sums)
 	h := sha256.New()
 	for _, sum := range ts.sums {
 		h.Write([]byte(sum))
